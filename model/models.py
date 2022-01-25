@@ -14,7 +14,31 @@ from transformers import (
 import torch.nn.functional as F
 from data.process_fn import triple_process_fn, triple2dual_process_fn
 from model.SEED_Encoder import SEEDEncoderConfig, SEEDTokenizer, SEEDEncoderForSequenceClassification,SEEDEncoderForMaskedLM
+#from fast_soft_sort.pytorch_ops import soft_rank
+from torchsort import soft_rank
 
+class DistPerm(nn.Module):
+    def __init__(self, m, k, d, reg=0.01):
+        super(DistPerm, self).__init__()
+        self.m = m
+        self.k = k
+        self.d = d
+        self.anchors = nn.Parameter(torch.randn(m, d), requires_grad=True)
+        self.reg = reg
+
+    def forward(self, X, soft=True):
+        distances = (torch.linalg.norm(X, dim=-1)**2).unsqueeze(1) - 2*X @ self.anchors.t() + \
+                    (torch.linalg.norm(self.anchors, dim=-1)**2).unsqueeze(0)
+        if soft:
+            rank_vecs = soft_rank(distances, regularization_strength=self.reg)
+            rank_vecs = torch.clamp(rank_vecs, max=self.k+1)
+        else:
+            rank_vecs = (self.k+1)*torch.ones((X.shape[0], self.m))
+            closest = torch.argsort(distances, dim=-1)[:, :self.k]
+            ids = torch.arange(X.shape[0])[:,None]
+            rank_vecs[ids, closest] = torch.arange(1, self.k+1)
+
+        return rank_vecs
 
 class EmbeddingMixin:
     """
@@ -42,7 +66,7 @@ class EmbeddingMixin:
 
     def masked_mean_or_first(self, emb_all, mask):
         # emb_all is a tuple from bert - sequence output, pooler
-        assert isinstance(emb_all, tuple)
+        #assert isinstance(emb_all, tuple)
         if self.use_mean:
             return self.masked_mean(emb_all[0], mask)
         else:
@@ -152,6 +176,26 @@ class RobertaDot_NLL_LN(NLL, RobertaForSequenceClassification):
         full_emb = self.masked_mean_or_first(outputs1, attention_mask)
         query1 = self.norm(self.embeddingHead(full_emb))
         return query1
+
+    def body_emb(self, input_ids, attention_mask):
+        return self.query_emb(input_ids, attention_mask)
+
+class RobertaDP_NLL_LN(NLL, RobertaForSequenceClassification):
+    def __init__(self, config, model_argobj=None):
+        NLL.__init__(self, model_argobj)
+        RobertaForSequenceClassification.__init__(self, config)
+        self.embeddingHead = nn.Linear(config.hidden_size, 768)
+        self.norm = nn.LayerNorm(768)
+        self.dp_encoder = DistPerm(model_argobj.num_anchors, model_argobj.partial_rank, 768, model_argobj.soft_reg)
+        self.apply(self._init_weights)
+
+    def query_emb(self, input_ids, attention_mask):
+        outputs1 = self.roberta(input_ids=input_ids,
+                                attention_mask=attention_mask)
+        full_emb = self.masked_mean_or_first(outputs1, attention_mask)
+        query1 = self.norm(self.embeddingHead(full_emb))
+        query_rank = self.dp_encoder(query1)
+        return query_rank
 
     def body_emb(self, input_ids, attention_mask):
         return self.query_emb(input_ids, attention_mask)
@@ -287,11 +331,12 @@ default_process_fn = triple_process_fn
 
 
 class MSMarcoConfig:
-    def __init__(self, name, model, process_fn=default_process_fn, use_mean=True, tokenizer_class=RobertaTokenizer, config_class=RobertaConfig):
+    def __init__(self, name, model, process_fn=default_process_fn, use_mean=True, dp_params=None, tokenizer_class=RobertaTokenizer, config_class=RobertaConfig):
         self.name = name
         self.process_fn = process_fn
         self.model_class = model
         self.use_mean = use_mean
+        self.dp_params = dp_params
         self.tokenizer_class = tokenizer_class
         self.config_class = config_class
 
@@ -300,20 +345,29 @@ configs = [
     MSMarcoConfig(name="rdot_nll",
                 model=RobertaDot_NLL_LN,
                 use_mean=False,
+                dp_params=None,
+                ),
+    MSMarcoConfig(name="rdp_nll",
+                model=RobertaDP_NLL_LN,
+                use_mean=False,
+                dp_params=None,
                 ),
     MSMarcoConfig(name="rdot_nll_multi_chunk",
                 model=RobertaDot_CLF_ANN_NLL_MultiChunk,
                 use_mean=False,
+                dp_params=None,
                 ),
     MSMarcoConfig(name="dpr",
                 model=BiEncoder,
                 tokenizer_class=BertTokenizer,
                 config_class=BertConfig,
                 use_mean=False,
+                dp_params=None,
                 ),
     MSMarcoConfig(name="seeddot_nll",
                 model=SEEDEncoderDot_NLL_LN,
                 use_mean=False,
+                dp_params=None,
                 tokenizer_class=SEEDTokenizer,
                 config_class=SEEDEncoderConfig,
                 ),

@@ -40,6 +40,12 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+class DataParallelPassthrough(nn.DataParallel):
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
 
 def train(args, model, tokenizer, f, train_fn):
     """ Train the model """
@@ -114,7 +120,7 @@ def train(args, model, tokenizer, f, train_fn):
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+        model = DataParallelPassthrough(model)
 
     # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
@@ -297,6 +303,11 @@ def load_stuff(model_type, args):
     configObj = MSMarcoConfigDict[model_type]
     model_args = type('', (), {})()
     model_args.use_mean = configObj.use_mean
+    if args.train_model_type == 'rdp_nll':
+        model_args.num_anchors = args.num_anchors
+        model_args.partial_rank = args.partial_rank
+        model_args.soft_reg = args.soft_reg
+
     config = configObj.config_class.from_pretrained(
         args.config_name if args.config_name else args.model_name_or_path,
         num_labels=args.num_labels,
@@ -518,6 +529,27 @@ def get_arguments():
          default=0, 
          type=int,
          help="Linear warmup over warmup_steps.",
+    )
+
+    parser.add_argument(
+        "--num_anchors",
+        default=0,
+        type=int,
+        help="Total number of anchors when using DP model.",
+    )
+
+    parser.add_argument(
+        "--partial_rank",
+        default=0,
+        type=int,
+        help="Number of ranked anchors when using DP model.",
+    )
+
+    parser.add_argument(
+        "--soft_reg",
+        default=0.1,
+        type=float,
+        help="Regularization for soft-rank operator",
     )
 
     parser.add_argument(
